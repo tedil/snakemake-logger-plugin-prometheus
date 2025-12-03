@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
 import logging
 import threading
 import sys
+from typing import Any
+
 from snakemake_interface_logger_plugins.base import LogHandlerBase
 from snakemake_interface_logger_plugins.settings import LogHandlerSettingsBase
 from snakemake_interface_logger_plugins.common import LogEvent
@@ -23,14 +24,16 @@ class LogHandlerSettings(LogHandlerSettingsBase):
             "help": "Port to expose Prometheus metrics on",
             "env_var": False,
             "required": False,
+            "type": int,
         },
     )
-    push_gateway: Optional[str] = field(
+    push_gateway: str | None = field(
         default=None,
         metadata={
             "help": "URL of the Prometheus Pushgateway (e.g. http://localhost:9091)",
             "env_var": False,
             "required": False,
+            "type": str,
         },
     )
     push_job_name: str = field(
@@ -39,63 +42,83 @@ class LogHandlerSettings(LogHandlerSettingsBase):
             "help": "Job name for the Pushgateway grouping",
             "env_var": False,
             "required": False,
+            "type": str,
         },
     )
 
 
+@dataclass
+class JobMetadata:
+    """
+    Structured container for job information extracted from JOB_INFO logs.
+    """
+
+    job_id: int
+    rule_name: str
+    resources: dict[str, int | float]
+    threads: int
+
+
 class LogHandler(LogHandlerBase):
     def __post_init__(self) -> None:
-        self.job_registry: Dict[int, Dict[str, Any]] = {}
-        self.running_jobs: Dict[int, Dict[str, Any]] = {}
+        self.job_registry: dict[int, JobMetadata] = {}
+        self.running_jobs: set[int] = set()
+        self.deferred_starts: set[int] = set()
+
+        self.metric_submitted = Gauge(
+            "snakemake_jobs_submitted",
+            "Number of jobs known to the scheduler (Queued + Running).",
+            ["rule"],
+        )
 
         self.metric_running = Gauge(
             "snakemake_jobs_running",
-            "Number of jobs currently running",
+            "Number of jobs actively executing.",
             ["rule"],
         )
 
         self.metric_finished = Counter(
             "snakemake_jobs_finished_total",
-            "Total number of jobs finished/failed",
+            "Total number of jobs finished/failed.",
             ["status", "rule"],
         )
 
         self.metric_resource_usage = Gauge(
             "snakemake_resource_usage_total",
-            "Total resources currently reserved by running jobs",
+            "Total resources currently consumed by RUNNING jobs.",
             ["resource"],
         )
 
         self.metric_resource_limits = Gauge(
             "snakemake_resource_limits",
-            "Maximum resources available to the workflow execution",
+            "Maximum resources available to the workflow execution.",
             ["resource"],
         )
 
         self.metric_progress = Gauge(
             "snakemake_workflow_progress",
-            "High-level workflow progress (jobs done vs total). Updates dynamically on checkpoints.",
+            "High-level workflow progress (jobs done vs total).",
             ["type"],  # 'done', 'total'
         )
 
         self.metric_planned = Gauge(
-            "snakemake_jobs_planned_total",
-            "Jobs planned per rule. May update during execution if checkpoints trigger DAG re-evaluation.",
-            ["rule"],
+            "snakemake_jobs_planned_total", "Jobs planned per rule. Updates on DAG re-evaluation.", ["rule"]
         )
 
-        self.metric_errors = Counter("snakemake_errors_total", "Total number of workflow errors")
+        self.metric_errors = Counter("snakemake_errors_total", "Total number of workflow errors.")
 
-        self.server_started = False
+        self._setup_server()
+        self._setup_push_gateway()
+
+    def _setup_server(self) -> None:
         port = getattr(self.settings, "port", 8000)
         try:
-            # start_http_server spawns a daemon thread
             start_http_server(port)
-            self.server_started = True
             sys.stderr.write(f"[PrometheusPlugin] Metrics server started on port {port}\n")
         except OSError as e:
             sys.stderr.write(f"[PrometheusPlugin] ⚠️ Could not start server on port {port}: {e}\n")
 
+    def _setup_push_gateway(self) -> None:
         self._stop_push_event = threading.Event()
         push_gateway = getattr(self.settings, "push_gateway", None)
 
@@ -113,11 +136,7 @@ class LogHandler(LogHandlerBase):
 
         while not self._stop_push_event.is_set():
             try:
-                push_to_gateway(
-                    push_gateway,
-                    job=push_job_name,
-                    registry=REGISTRY,
-                )
+                push_to_gateway(push_gateway, job=push_job_name, registry=REGISTRY)
             except Exception as e:
                 sys.stderr.write(f"[PrometheusPlugin] Push failed: {e}\n")
 
@@ -125,32 +144,31 @@ class LogHandler(LogHandlerBase):
                 break
 
     def close(self) -> None:
-        """Cleanup logic called when Snakemake shuts down."""
-        # Stop push thread if running
         if hasattr(self, "_stop_push_event"):
             self._stop_push_event.set()
             if hasattr(self, "_push_thread") and self._push_thread.is_alive():
-                try:
-                    push_gateway = getattr(self.settings, "push_gateway", None)
-                    push_job_name = getattr(self.settings, "push_job_name", "snakemake")
-                    if push_gateway:
-                        push_to_gateway(push_gateway, job=push_job_name, registry=REGISTRY)
-                except Exception:
-                    pass
                 self._push_thread.join(timeout=1.0)
 
-        try:
-            REGISTRY.unregister(self.metric_running)
-            REGISTRY.unregister(self.metric_finished)
-            REGISTRY.unregister(self.metric_resource_usage)
-            REGISTRY.unregister(self.metric_resource_limits)
-            REGISTRY.unregister(self.metric_progress)
-            REGISTRY.unregister(self.metric_planned)
-            REGISTRY.unregister(self.metric_errors)
-        except (KeyError, AttributeError, TypeError):
-            pass
-
+        self._cleanup_registry()
         super().close()
+
+    def _cleanup_registry(self) -> None:
+        """Unregister metrics to prevent state bleeding in test suites."""
+        metrics = [
+            self.metric_submitted,
+            self.metric_running,
+            self.metric_finished,
+            self.metric_resource_usage,
+            self.metric_resource_limits,
+            self.metric_progress,
+            self.metric_planned,
+            self.metric_errors,
+        ]
+        for m in metrics:
+            try:
+                REGISTRY.unregister(m)
+            except (KeyError, AttributeError, TypeError):
+                pass
 
     @property
     def writes_to_stream(self) -> bool:
@@ -199,11 +217,42 @@ class LogHandler(LogHandlerBase):
         except Exception:
             self.handleError(record)
 
+    def _parse_resources(self, record: logging.LogRecord) -> dict[str, int | float]:
+        """
+        Robustly extracts resources from a LogRecord.
+        Handles: dicts, argparse.Namespace, and Snakemake's internal Resource objects.
+        """
+        raw_res = getattr(record, "resources", None)
+        resources: dict[str, Any] = {}
+
+        if raw_res:
+            if hasattr(raw_res, "_names"):
+                for name in raw_res._names:
+                    resources[name] = getattr(raw_res, name)
+            elif isinstance(raw_res, dict):
+                resources = raw_res.copy()
+            elif hasattr(raw_res, "__dict__"):
+                resources = vars(raw_res).copy()
+            elif hasattr(raw_res, "keys") and callable(raw_res.keys):
+                for k in raw_res.keys():
+                    resources[k] = raw_res[k]
+
+        filtered: dict[str, int | float] = {
+            k: v for k, v in resources.items() if k not in {"_cores", "_nodes"} and isinstance(v, (int, float))
+        }
+
+        if "threads" not in filtered:
+            threads = getattr(record, "threads", 1)
+            if isinstance(threads, (int, float)):
+                filtered["threads"] = threads
+
+        return filtered
+
     def _handle_run_info(self, record: logging.LogRecord) -> None:
         """Handles run info (DAG stats). Can be called multiple times if DAG is re-evaluated."""
-        per_rule_counts = getattr(record, "per_rule_job_counts", {})
-        if per_rule_counts:
-            for rule, count in per_rule_counts.items():
+        counts = getattr(record, "per_rule_job_counts", {})
+        if counts:
+            for rule, count in counts.items():
                 self.metric_planned.labels(rule=rule).set(count)
 
     def _handle_progress(self, record: logging.LogRecord) -> None:
@@ -220,9 +269,9 @@ class LogHandler(LogHandlerBase):
             self.metric_resource_limits.labels(resource="threads").set(cores)
             self.metric_resource_limits.labels(resource="cores").set(cores)
 
-        provided_resources = getattr(record, "provided_resources", {})
-        if provided_resources:
-            for res, value in provided_resources.items():
+        provided = getattr(record, "provided_resources", {})
+        if provided:
+            for res, value in provided.items():
                 if isinstance(value, (int, float)):
                     self.metric_resource_limits.labels(resource=res).set(value)
 
@@ -231,80 +280,81 @@ class LogHandler(LogHandlerBase):
         if job_id is None:
             return
 
-        raw_resources = getattr(record, "resources", None)
-        resources = {}
+        rule_name = getattr(record, "rule_name", "unknown")
+        resources = self._parse_resources(record)
+        threads = int(resources.get("threads", 1))
 
-        if raw_resources:
-            if isinstance(raw_resources, dict):
-                resources = raw_resources.copy()
-            elif hasattr(raw_resources, "__dict__"):
-                resources = vars(raw_resources).copy()
-            elif hasattr(raw_resources, "_names"):
-                resources = {name: getattr(raw_resources, name) for name in raw_resources._names}
+        metadata = JobMetadata(job_id=job_id, rule_name=rule_name, resources=resources, threads=threads)
 
-        resources = {k: v for k, v in resources.items() if k not in {"_cores", "_nodes"}}
-        if "threads" not in resources:
-            resources["threads"] = getattr(record, "threads", 1)
+        self.job_registry[job_id] = metadata
 
-        self.job_registry[job_id] = {
-            "rule": getattr(record, "rule_name", "unknown"),
-            "resources": resources,
-        }
+        self.metric_submitted.labels(rule=rule_name).inc()
+
+        if job_id in self.deferred_starts:
+            self.deferred_starts.remove(job_id)
+            self._record_job_start(metadata)
 
     def _handle_job_started(self, record: logging.LogRecord) -> None:
-        job_ids = getattr(record, "jobs", [])
+        job_ids = getattr(record, "job_ids", [])
+
+        if not job_ids:
+            job_ids = getattr(record, "jobs", [])
 
         if isinstance(job_ids, int):
             job_ids = [job_ids]
-
-        if not job_ids:
-            if hasattr(record, "job_ids"):
-                job_ids = record.job_ids
-            elif hasattr(record, "jobid"):
-                job_ids = [record.jobid]
+        elif not job_ids and hasattr(record, "jobid"):
+            jid = getattr(record, "jobid")
+            if jid is not None:
+                job_ids = [jid]
 
         for job_id in job_ids:
-            job_info = self.job_registry.get(job_id)
-            if not job_info:
+            if not isinstance(job_id, int):
                 continue
 
-            rule_name = job_info["rule"]
-            self.metric_running.labels(rule=rule_name).inc()
+            if job_id in self.job_registry:
+                self._record_job_start(self.job_registry[job_id])
+            else:
+                self.deferred_starts.add(job_id)
 
-            for res_name, res_value in job_info["resources"].items():
-                if isinstance(res_value, (int, float)):
-                    self.metric_resource_usage.labels(resource=res_name).inc(res_value)
+    def _record_job_start(self, metadata: JobMetadata) -> None:
+        """Internal helper to increment running metrics."""
+        if metadata.job_id in self.running_jobs:
+            return
 
-            self.running_jobs[job_id] = job_info
+        self.metric_running.labels(rule=metadata.rule_name).inc()
+
+        for res_name, res_value in metadata.resources.items():
+            self.metric_resource_usage.labels(resource=res_name).inc(res_value)
+
+        self.running_jobs.add(metadata.job_id)
 
     def _handle_job_finished(self, record: logging.LogRecord) -> None:
         job_id = getattr(record, "job_id", getattr(record, "jobid", None))
-        if job_id is None:
-            return
-        self._finalize_job(job_id, "finished")
+        if job_id is not None:
+            self._finalize_job(job_id, "finished")
 
     def _handle_job_error(self, record: logging.LogRecord) -> None:
         job_id = getattr(record, "jobid", None)
-        if job_id is None:
-            return
-        self._finalize_job(job_id, "failed")
+        if job_id is not None:
+            self._finalize_job(job_id, "failed")
 
     def _finalize_job(self, job_id: int, final_status: str) -> None:
-        job_info = self.running_jobs.pop(job_id, None)
+        job_info = self.job_registry.pop(job_id, None)
 
-        if not job_info:
-            job_info = self.job_registry.get(job_id)
+        if job_id in self.deferred_starts:
+            self.deferred_starts.remove(job_id)
 
         if job_info:
-            rule_name = job_info["rule"]
+            rule = job_info.rule_name
 
-            self.metric_finished.labels(status=final_status, rule=rule_name).inc()
+            self.metric_finished.labels(status=final_status, rule=rule).inc()
 
-            if job_info:
-                self.metric_running.labels(rule=rule_name).dec()
+            self.metric_submitted.labels(rule=rule).dec()
 
-                for res_name, res_value in job_info["resources"].items():
-                    if isinstance(res_value, (int, float)):
-                        self.metric_resource_usage.labels(resource=res_name).dec(res_value)
+            if job_id in self.running_jobs:
+                self.metric_running.labels(rule=rule).dec()
 
-            self.job_registry.pop(job_id, None)
+                for res_name, res_value in job_info.resources.items():
+                    self.metric_resource_usage.labels(resource=res_name).dec(res_value)
+
+                self.running_jobs.remove(job_id)

@@ -47,26 +47,21 @@ def test_integration_snakemake_run(workdir):
         str(snakefile_path),
     ]
 
-    # Start Snakemake
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     try:
         start_time = time.time()
         metric_found = False
-        timeout = 15
 
-        while time.time() - start_time < timeout:
-            # check if process dies early
+        while time.time() - start_time < 15:
             if proc.poll() is not None:
                 outs, errs = proc.communicate()
-                pytest.fail(f"Snakemake process finished prematurely.\nSTDOUT: {outs}\nSTDERR: {errs}")
+                pytest.fail(f"Snakemake exited early.\nSTDOUT: {outs}\nSTDERR: {errs}")
 
             try:
                 response = requests.get(f"http://localhost:{test_port}/metrics")
                 if response.status_code == 200:
-                    metrics = response.text
-
-                    if 'snakemake_jobs_running{rule="sleeper"}' in metrics:
+                    if 'snakemake_jobs_running{rule="sleeper"}' in response.text:
                         metric_found = True
                         break
             except requests.exceptions.ConnectionError:
@@ -75,14 +70,7 @@ def test_integration_snakemake_run(workdir):
             time.sleep(0.5)
 
         if not metric_found:
-            try:
-                metrics = requests.get(f"http://localhost:{test_port}/metrics").text
-            except:
-                metrics = "Could not retrieve metrics"
-
-            proc.terminate()
-            outs, errs = proc.communicate()
-            pytest.fail(f"Timeout waiting for 'sleeper' metric.\nLast Metrics:\n{metrics}\nSnakemake Stderr:\n{errs}")
+            pytest.fail("Timeout waiting for 'sleeper' metric.")
 
         assert metric_found
 
