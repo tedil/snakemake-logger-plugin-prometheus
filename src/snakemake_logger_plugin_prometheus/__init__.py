@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import logging
 import threading
 import sys
+import uuid
 from typing import Any
 
 from snakemake_interface_logger_plugins.base import LogHandlerBase
@@ -45,6 +46,15 @@ class LogHandlerSettings(LogHandlerSettingsBase):
             "type": str,
         },
     )
+    run_id: str | None = field(
+        default=None,
+        metadata={
+            "help": "Unique identifier for this workflow run (label). Defaults to UUID.",
+            "env_var": False,
+            "required": False,
+            "type": str,
+        },
+    )
 
 
 @dataclass
@@ -65,47 +75,52 @@ class LogHandler(LogHandlerBase):
         self.running_jobs: set[int] = set()
         self.deferred_starts: set[int] = set()
 
+        self.run_id = getattr(self.settings, "run_id", None)
+        if not self.run_id:
+            self.run_id = str(uuid.uuid4())
+            sys.stderr.write(f"[PrometheusPlugin] Auto-generated run_id: {self.run_id}\n")
+
         self.metric_submitted = Gauge(
             "snakemake_jobs_submitted",
             "Number of jobs known to the scheduler (Queued + Running).",
-            ["rule"],
+            ["run_id", "rule"],
         )
 
         self.metric_running = Gauge(
             "snakemake_jobs_running",
             "Number of jobs actively executing.",
-            ["rule"],
+            ["run_id", "rule"],
         )
 
         self.metric_finished = Counter(
             "snakemake_jobs_finished_total",
             "Total number of jobs finished/failed.",
-            ["status", "rule"],
+            ["run_id", "status", "rule"],
         )
 
         self.metric_resource_usage = Gauge(
             "snakemake_resource_usage_total",
             "Total resources currently consumed by RUNNING jobs.",
-            ["resource"],
+            ["run_id", "resource"],
         )
 
         self.metric_resource_limits = Gauge(
             "snakemake_resource_limits",
             "Maximum resources available to the workflow execution.",
-            ["resource"],
+            ["run_id", "resource"],
         )
 
         self.metric_progress = Gauge(
             "snakemake_workflow_progress",
             "High-level workflow progress (jobs done vs total).",
-            ["type"],  # 'done', 'total'
+            ["run_id", "type"],
         )
 
         self.metric_planned = Gauge(
-            "snakemake_jobs_planned_total", "Jobs planned per rule. Updates on DAG re-evaluation.", ["rule"]
+            "snakemake_jobs_planned_total", "Jobs planned per rule. Updates on DAG re-evaluation.", ["run_id", "rule"]
         )
 
-        self.metric_errors = Counter("snakemake_errors_total", "Total number of workflow errors.")
+        self.metric_errors = Counter("snakemake_errors_total", "Total number of workflow errors.", ["run_id"])
 
         self._setup_server()
         self._setup_push_gateway()
@@ -136,7 +151,9 @@ class LogHandler(LogHandlerBase):
 
         while not self._stop_push_event.is_set():
             try:
-                push_to_gateway(push_gateway, job=push_job_name, registry=REGISTRY)
+                push_to_gateway(
+                    push_gateway, job=push_job_name, registry=REGISTRY, grouping_key={"run_id": self.run_id}
+                )
             except Exception as e:
                 sys.stderr.write(f"[PrometheusPlugin] Push failed: {e}\n")
 
@@ -206,7 +223,7 @@ class LogHandler(LogHandlerBase):
             elif event == LogEvent.JOB_ERROR:
                 self._handle_job_error(record)
             elif event == LogEvent.ERROR:
-                self.metric_errors.inc()
+                self.metric_errors.labels(run_id=self.run_id).inc()
             elif event == LogEvent.RUN_INFO:
                 self._handle_run_info(record)
             elif event == LogEvent.PROGRESS:
@@ -253,27 +270,27 @@ class LogHandler(LogHandlerBase):
         counts = getattr(record, "per_rule_job_counts", {})
         if counts:
             for rule, count in counts.items():
-                self.metric_planned.labels(rule=rule).set(count)
+                self.metric_planned.labels(run_id=self.run_id, rule=rule).set(count)
 
     def _handle_progress(self, record: logging.LogRecord) -> None:
         """Handles progress updates. 'total' can change dynamically via checkpoints."""
         done = getattr(record, "done", 0)
         total = getattr(record, "total", 0)
-        self.metric_progress.labels(type="done").set(done)
-        self.metric_progress.labels(type="total").set(total)
+        self.metric_progress.labels(run_id=self.run_id, type="done").set(done)
+        self.metric_progress.labels(run_id=self.run_id, type="total").set(total)
 
     def _handle_resources_info(self, record: logging.LogRecord) -> None:
         """Handles the global resources info to set usage limits."""
         cores = getattr(record, "cores", None)
         if cores is not None:
-            self.metric_resource_limits.labels(resource="threads").set(cores)
-            self.metric_resource_limits.labels(resource="cores").set(cores)
+            self.metric_resource_limits.labels(run_id=self.run_id, resource="threads").set(cores)
+            self.metric_resource_limits.labels(run_id=self.run_id, resource="cores").set(cores)
 
         provided = getattr(record, "provided_resources", {})
         if provided:
             for res, value in provided.items():
                 if isinstance(value, (int, float)):
-                    self.metric_resource_limits.labels(resource=res).set(value)
+                    self.metric_resource_limits.labels(run_id=self.run_id, resource=res).set(value)
 
     def _handle_job_info(self, record: logging.LogRecord) -> None:
         job_id = getattr(record, "jobid", None)
@@ -288,7 +305,7 @@ class LogHandler(LogHandlerBase):
 
         self.job_registry[job_id] = metadata
 
-        self.metric_submitted.labels(rule=rule_name).inc()
+        self.metric_submitted.labels(run_id=self.run_id, rule=rule_name).inc()
 
         if job_id in self.deferred_starts:
             self.deferred_starts.remove(job_id)
@@ -321,10 +338,10 @@ class LogHandler(LogHandlerBase):
         if metadata.job_id in self.running_jobs:
             return
 
-        self.metric_running.labels(rule=metadata.rule_name).inc()
+        self.metric_running.labels(run_id=self.run_id, rule=metadata.rule_name).inc()
 
         for res_name, res_value in metadata.resources.items():
-            self.metric_resource_usage.labels(resource=res_name).inc(res_value)
+            self.metric_resource_usage.labels(run_id=self.run_id, resource=res_name).inc(res_value)
 
         self.running_jobs.add(metadata.job_id)
 
@@ -347,14 +364,14 @@ class LogHandler(LogHandlerBase):
         if job_info:
             rule = job_info.rule_name
 
-            self.metric_finished.labels(status=final_status, rule=rule).inc()
+            self.metric_finished.labels(run_id=self.run_id, status=final_status, rule=rule).inc()
 
-            self.metric_submitted.labels(rule=rule).dec()
+            self.metric_submitted.labels(run_id=self.run_id, rule=rule).dec()
 
             if job_id in self.running_jobs:
-                self.metric_running.labels(rule=rule).dec()
+                self.metric_running.labels(run_id=self.run_id, rule=rule).dec()
 
                 for res_name, res_value in job_info.resources.items():
-                    self.metric_resource_usage.labels(resource=res_name).dec(res_value)
+                    self.metric_resource_usage.labels(run_id=self.run_id, resource=res_name).dec(res_value)
 
                 self.running_jobs.remove(job_id)
