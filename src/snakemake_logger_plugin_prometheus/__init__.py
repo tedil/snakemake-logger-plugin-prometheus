@@ -71,6 +71,8 @@ class JobMetadata:
 
 class LogHandler(LogHandlerBase):
     def __post_init__(self) -> None:
+        if self.common_settings.dryrun:
+            return
         self.job_registry: dict[int, JobMetadata] = {}
         self.running_jobs: set[int] = set()
         self.deferred_starts: set[int] = set()
