@@ -1,6 +1,6 @@
 [project]
 name = "snakemake-logger-plugin-prometheus"
-version = "0.1.0"
+version = "0.1.1"
 description = "Snakemake logger plugin that exposes job info to prometheus."
 readme = "README.md"
 authors = [{ name = "Till Hartmann", email = "till.hartmann@bih-charite.de" }]
