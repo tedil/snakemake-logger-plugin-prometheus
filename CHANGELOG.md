@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/tedil/snakemake-logger-plugin-prometheus/compare/v0.1.1...v0.1.2) (2026-05-28)
+
+
+### Bug Fixes
+
+* do not try unregistering non-initialized metrics ([f8d12ad](https://github.com/tedil/snakemake-logger-plugin-prometheus/commit/f8d12ad294a1779ecf052429ded070512493974f))
+* dryrun cleanup should not access metrics ([fc7f157](https://github.com/tedil/snakemake-logger-plugin-prometheus/commit/fc7f1579d32d481f0c7c65be5f93c5b4d695df46))
+
 ## 0.1.1 (2026-03-13)
 
 
