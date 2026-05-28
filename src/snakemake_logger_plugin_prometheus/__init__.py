@@ -183,11 +183,13 @@ class LogHandler(LogHandlerBase):
             self.metric_planned,
             self.metric_errors,
         ]
-        for m in metrics:
-            try:
-                REGISTRY.unregister(m)
-            except (KeyError, AttributeError, TypeError):
-                pass
+        for name in metrics:
+            metric = getattr(self, name, None)
+            if metric is not None:
+                try:
+                    REGISTRY.unregister(metric)
+                except (KeyError, AttributeError, TypeError):
+                    pass
 
     @property
     def writes_to_stream(self) -> bool:
