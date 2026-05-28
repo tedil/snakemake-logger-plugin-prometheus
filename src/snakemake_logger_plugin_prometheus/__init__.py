@@ -173,17 +173,18 @@ class LogHandler(LogHandlerBase):
 
     def _cleanup_registry(self) -> None:
         """Unregister metrics to prevent state bleeding in test suites."""
-        metrics = [
-            self.metric_submitted,
-            self.metric_running,
-            self.metric_finished,
-            self.metric_resource_usage,
-            self.metric_resource_limits,
-            self.metric_progress,
-            self.metric_planned,
-            self.metric_errors,
+        metric_names = [
+            "metric_submitted",
+            "metric_running",
+            "metric_finished",
+            "metric_resource_usage",
+            "metric_resource_limits",
+            "metric_progress",
+            "metric_planned",
+            "metric_errors",
         ]
-        for name in metrics:
+
+        for name in metric_names:
             metric = getattr(self, name, None)
             if metric is not None:
                 try:
