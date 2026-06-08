@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/tedil/snakemake-logger-plugin-prometheus/compare/v0.1.2...v0.1.3) (2026-06-08)
+
+
+### Bug Fixes
+
+* avoid dry-run access issues ([2fffdaf](https://github.com/tedil/snakemake-logger-plugin-prometheus/commit/2fffdaf1061bcb60eed2425678b0e8bf2431f40b))
+* avoid dry-run access issues ([e83579a](https://github.com/tedil/snakemake-logger-plugin-prometheus/commit/e83579aeb88ef87a2d4222ae9c96258b39e728ec))
+
 ## [0.1.2](https://github.com/tedil/snakemake-logger-plugin-prometheus/compare/v0.1.1...v0.1.2) (2026-05-28)
 
 
